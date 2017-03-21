@@ -29,33 +29,43 @@ require 'fluent/mixin/rewrite_tag_name'
 
 module Fluent
 class SplunkHTTPEventcollectorOutput < BufferedOutput
-  
+
   Plugin.register_output('splunk-http-eventcollector', self)
 
   include Fluent::HandleTagNameMixin
   include Fluent::Mixin::RewriteTagName
 
   config_param :test_mode, :bool, :default => false
-  
+
   config_param :server, :string, :default => 'localhost:8088'
   config_param :verify, :bool, :default => true
   config_param :token, :string, :default => nil
-  
+
   # Event parameters
   config_param :protocol, :string, :default => 'https'
   config_param :host, :string, :default => nil
   config_param :index, :string, :default => 'main'
   config_param :all_items, :bool, :default => false
-  
+
   config_param :sourcetype, :string, :default => 'fluentd'
   config_param :source, :string, :default => nil
   config_param :post_retry_max, :integer, :default => 5
   config_param :post_retry_interval, :integer, :default => 5
-  
+
   # TODO Find better upper limits
   config_param :batch_size_limit, :integer, :default => 262144 # 65535
   #config_param :batch_event_limit, :integer, :default => 100
-  
+
+  # Whether to allow non-UTF-8 characters in user logs. If set to true, any
+  # non-UTF-8 character would be replaced by the string specified by
+  # 'non_utf8_replacement_string'. If set to false, any non-UTF-8 character
+  # would trigger the plugin to error out.
+  config_param :coerce_to_utf8, :bool, :default => true
+
+  # If 'coerce_to_utf8' is set to true, any non-UTF-8 character would be
+  # replaced by the string specified here.
+  config_param :non_utf8_replacement_string, :string, :default => ' '
+
   # Called on class load (class initializer)
   def initialize
     super
@@ -63,7 +73,7 @@ class SplunkHTTPEventcollectorOutput < BufferedOutput
     require 'net/http/persistent'
     require 'openssl'
   end  # initialize
-  
+
   ## This method is called before starting.
   ## 'conf' is a Hash that includes configuration parameters.
   ## If the configuration is invalid, raise Fluent::ConfigError.
@@ -77,7 +87,7 @@ class SplunkHTTPEventcollectorOutput < BufferedOutput
     end
     # TODO Add other robust input/syntax checks.
   end  # configure
-  
+
   ## This method is called when starting.
   ## Open sockets or files here.
   def start
@@ -88,20 +98,20 @@ class SplunkHTTPEventcollectorOutput < BufferedOutput
     @http.override_headers['Content-Type'] = 'application/json'
     @http.override_headers['User-Agent'] = 'fluent-plugin-splunk-http-eventcollector/0.0.1'
     @http.override_headers['Authorization'] = "Splunk #{@token}"
-    
+
     log.trace "initialized for splunk-http-eventcollector"
   end
-  
+
   ## This method is called when shutting down.
   ## Shutdown the thread and close sockets or files here.
   def shutdown
     super
     log.trace "splunk-http-eventcollector(shutdown) called"
-    
+
     @http.shutdown
     log.trace "shutdown from splunk-http-eventcollector"
   end  # shutdown
-  
+
   ## This method is called when an event reaches to Fluentd. (like unbuffered emit())
   ## Convert the event to a raw string.
   def format(tag, time, record)
@@ -118,16 +128,20 @@ class SplunkHTTPEventcollectorOutput < BufferedOutput
       ]
     # TODO: parse different source types as expected: KVP, JSON, TEXT
     if @all_items
-        splunk_object["event"] = record
+      record.each do |key, value|
+        record[key] = convert_to_utf8(value)
+      end
+      splunk_object["event"] = record
     else
-        splunk_object["event"] = record["message"]
+      splunk_object["event"] = convert_to_utf8(record["message"])
     end
+
     json_event = splunk_object.to_json
     #log.debug "Generated JSON(#{json_event.class.to_s}): #{json_event.to_s}"
     #log.debug "format: returning: #{[tag, record].to_json.to_s}"
     json_event
   end
-  
+
   # By this point, fluentd has decided its buffer is full and it's time to flush
   # it. chunk.read is a concatenated string of JSON.to_s objects. Simply POST
   # them to Splunk and go about our life.
@@ -140,7 +154,7 @@ class SplunkHTTPEventcollectorOutput < BufferedOutput
   ## NOTE! This method is called by internal thread, not Fluentd's main thread. So IO wait doesn't affect other plugins.
   def write(chunk)
     log.trace "splunk-http-eventcollector(write) called"
-    
+
     # Break the concatenated string of JSON-formatted events into an Array
     split_chunk = chunk.read.split("}{").each do |x|
       # Reconstruct the opening{/closing} that #split() strips off.
@@ -153,12 +167,12 @@ class SplunkHTTPEventcollectorOutput < BufferedOutput
     # Don't care about the number of events so much as the POST size (bytes)
     #if split_chunk.size > @batch_event_limit
     #  log.warn "Fluentd is attempting to push #{numfmt(split_chunk.size)} " +
-    #      "events in a single push to Splunk. The configured limit is " + 
+    #      "events in a single push to Splunk. The configured limit is " +
     #      "#{numfmt(@batch_event_limit)}."
     #end
     if chunk.read.bytesize > @batch_size_limit
       log.warn "Fluentd is attempting to push #{numfmt(chunk.read.bytesize)} " +
-          "bytes in a single push to Splunk. The configured limit is " + 
+          "bytes in a single push to Splunk. The configured limit is " +
           "#{numfmt(@batch_size_limit)} bytes."
       newbuffer = Array.new
       split_chunk_counter = 0
@@ -188,7 +202,7 @@ class SplunkHTTPEventcollectorOutput < BufferedOutput
       return push_buffer chunk.read
     end # if chunk.read.bytesize > @batch_size_limit
   end # write
-  
+
   def push_buffer(body)
     post = Net::HTTP::Post.new @splunk_uri.request_uri
     post.body = body
@@ -230,9 +244,35 @@ class SplunkHTTPEventcollectorOutput < BufferedOutput
       end # If response.code
     end # 1.upto(@post_retry_max)
   end # push_buffer
-  
+
   def numfmt(input)
     input.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\1,').reverse
   end # numfmt
+
+  # Encode as UTF-8. If 'coerce_to_utf8' is set to true in the config, any
+  # non-UTF-8 character would be replaced by the string specified by
+  # 'non_utf8_replacement_string'. If 'coerce_to_utf8' is set to false, any
+  # non-UTF-8 character would trigger the plugin to error out.
+  def convert_to_utf8(input)
+    return input unless input.respond_to?(:encode)
+
+    if @coerce_to_utf8
+      input.encode(
+        'utf-8',
+        invalid: :replace,
+        undef: :replace,
+        replace: @non_utf8_replacement_string)
+    else
+      begin
+        input.encode('utf-8')
+      rescue EncodingError
+        @log.error 'Encountered encoding issues potentially due to non ' \
+                   'UTF-8 characters. To allow non-UTF-8 characters and ' \
+                   'replace them with spaces, please set "coerce_to_utf8" ' \
+                   'to true.'
+        raise
+      end
+    end
+  end
 end  # class SplunkHTTPEventcollectorOutput
 end  # module Fluent
