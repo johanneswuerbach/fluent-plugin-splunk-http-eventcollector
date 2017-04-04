@@ -128,10 +128,7 @@ class SplunkHTTPEventcollectorOutput < BufferedOutput
       ]
     # TODO: parse different source types as expected: KVP, JSON, TEXT
     if @all_items
-      record.each do |key, value|
-        record[key] = convert_to_utf8(value)
-      end
-      splunk_object["event"] = record
+      splunk_object["event"] = convert_to_utf8(record)
     else
       splunk_object["event"] = convert_to_utf8(record["message"])
     end
@@ -254,6 +251,15 @@ class SplunkHTTPEventcollectorOutput < BufferedOutput
   # 'non_utf8_replacement_string'. If 'coerce_to_utf8' is set to false, any
   # non-UTF-8 character would trigger the plugin to error out.
   def convert_to_utf8(input)
+    if input.is_a?(Hash)
+      record = {}
+      input.each do |key, value|
+        record[convert_to_utf8(key)] = convert_to_utf8(value)
+      end
+
+      return record
+    end
+    return input.map { |value| convert_to_utf8(value) } if input.is_a?(Array)
     return input unless input.respond_to?(:encode)
 
     if @coerce_to_utf8
